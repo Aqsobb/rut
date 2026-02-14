@@ -1,0 +1,419 @@
+// index.js
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios'); 
+const { TOKEN, OWNER_ID, BOT_NAME, OWNER_NAMA, OWNER_NOMOR_HP } = require('./config');
+
+// Database & Services (URUTAN AMAN - JANGAN DIUBAH)
+const { get_user_data, register_user, load_db, save_db, kurangi_limit, add_premium } = require('./database');
+const { kirim_email_sakti, hapus_pesan_terkirim, cek_dan_hapus_balasan } = require('./email_service');
+const { startUserSession, process_bulk_wa, initAutoResume, checkSessionStatus } = require('./wa_service');
+const { tiktok_download } = require('./tiktok_service'); 
+const MSG = require('./utils/messages');
+
+// --- SETTINGAN BOT STABIL ---
+const bot = new TelegramBot(TOKEN, { 
+    polling: {
+        interval: 300,
+        autoStart: true,
+        params: { timeout: 10 }
+    } 
+});
+
+const userStates = {};
+const SAFE_OWNER_ID = String(OWNER_ID).trim();
+
+// ANTI CRASH (PENTING BIAR GAK MATI KONYOL)
+process.on('uncaughtException', (err) => console.log('⚠️ Error (Ignored):', err.message));
+process.on('unhandledRejection', (err) => console.log('⚠️ Promise Error (Ignored):', err.message));
+
+initAutoResume();
+
+// SET COMMAND TELEGRAM
+const setMenu = async () => {
+    try {
+        await bot.setMyCommands([
+            { command: 'start', description: '🤖 Menu Utama' },
+            { command: 'fix', description: '💉 Fix Nomor' },
+            { command: 'cekwa', description: '🔍 Cek Bio Massal' },
+            { command: 'pair', description: '🔗 Sambungin WA' },
+            { command: 'profile', description: '👤 Profil' },
+            { command: 'owner', description: '📞 Owner' }
+        ]);
+        console.log("✅ Menu Updated!");
+    } catch (e) {}
+};
+setMenu();
+
+// --- MESSAGE HANDLER ---
+bot.on('message', async (msg) => {
+    try {
+        const chatId = msg.chat.id;
+        const text = msg.text;
+        const userId = String(msg.from.id);
+
+        if (!text || text.startsWith('/')) return;
+
+        // --- 🎵 FITUR TIKTOK DOWNLOADER (AUTO DETECT) ---
+        if (text.includes('tiktok.com')) {
+            const sentMsg = await bot.sendMessage(chatId, "⏳ *Sedang memproses TikTok...*", { parse_mode: 'Markdown' });
+            
+            const data = await tiktok_download(text);
+            
+            if (data.status) {
+                bot.deleteMessage(chatId, sentMsg.message_id).catch(()=>{});
+
+                const caption = `🎥 *TIKTOK DOWNLOADER*\n\n👤 *Author:* ${data.author}\n📝 *Desc:* ${data.title}\n\nPilih format download di bawah:`;
+                
+                const keyboardMarkup = {
+                    inline_keyboard: [
+                        [
+                            { text: "🎥 VIDEO (NO WM)", callback_data: `tt_vid` },
+                            { text: "🎵 AUDIO (MP3)", callback_data: `tt_aud` }
+                        ]
+                    ]
+                };
+
+                userStates[chatId] = { 
+                    step: 'TIKTOK_WAIT', 
+                    video_url: data.video, 
+                    music_url: data.music 
+                };
+
+                if (data.cover && data.cover.startsWith('http')) {
+                    await bot.sendPhoto(chatId, data.cover, { 
+                        caption: caption, 
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboardMarkup
+                    });
+                } else {
+                    await bot.sendMessage(chatId, caption, { 
+                        parse_mode: 'Markdown',
+                        reply_markup: keyboardMarkup
+                    });
+                }
+            } else {
+                bot.editMessageText(`❌ Gagal: ${data.msg}`, { chat_id: chatId, message_id: sentMsg.message_id });
+            }
+            return;
+        }
+
+        // CEK STATE (PROSES YANG SEDANG BERJALAN)
+        if (userStates[chatId]) {
+            const state = userStates[chatId];
+
+            if (state.step === 'ASK_EMAIL') {
+                state.data.email = text;
+                state.step = 'ASK_PASS';
+                await bot.sendMessage(chatId, MSG.setup_pass, { parse_mode: 'Markdown' });
+                return;
+            } else if (state.step === 'ASK_PASS') {
+                state.data.pass = text.replace(/\s/g, '');
+                state.step = 'ASK_NAME';
+                await bot.sendMessage(chatId, MSG.setup_name, { parse_mode: 'Markdown' });
+                return;
+            } else if (state.step === 'ASK_NAME') {
+                register_user(userId, state.data.email, state.data.pass, text);
+                delete userStates[chatId];
+                await sendMainMenu(chatId, userId, MSG.setup_done);
+                return;
+            }
+            
+            // --- 💉 FIX NOMOR (LOGIKA TERBARU: KIRIM HAPUS & TERIMA HAPUS) ---
+            else if (state.step === 'ASK_FIX_NUMBER') {
+                delete userStates[chatId];
+                const nomor = text;
+                const data = get_user_data(userId);
+                
+                const sentMsg = await bot.sendMessage(chatId, MSG.email_sending, { parse_mode: 'Markdown' });
+                console.log(`🚀 Memulai proses fix untuk ${nomor}...`);
+                
+                // 1. KIRIM EMAIL SAKTI
+                const result = await kirim_email_sakti(data.email, data.password, data.nama, nomor);
+
+                if (result.success) {
+                    const myTicket = result.ticket;
+
+                    // 2. LOGIKA KIRIM HAPUS (Hapus jejak di folder Sent)
+                    await hapus_pesan_terkirim(data.email, data.password).catch(() => {});
+                    
+                    await bot.editMessageText(MSG.email_sent, { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' }).catch(() => {}); 
+                    
+                    console.log(`👀 [SYSTEM] Hunting balasan untuk: ${nomor} / ${myTicket}`);
+                    let replyFound = false;
+
+                    // 3. LOGIKA TERIMA HAPUS (Loop cek Inbox & Lenyapkan)
+                    for (let i = 0; i < 150; i++) { 
+                        await new Promise(r => setTimeout(r, 2000));
+                        // Fungsi ini otomatis baca lalu hapus balasan dari Inbox
+                        const check = await cek_dan_hapus_balasan(data.email, data.password, myTicket, nomor);
+                        if (check) { 
+                            replyFound = true; 
+                            console.log("✅ [SYSTEM] BALASAN DITERIMA & DIHAPUS.");
+                            break; 
+                        }
+                    }
+                    
+                    kurangi_limit(userId);
+                    
+                    if (replyFound) {
+                        try {
+                            await bot.editMessageText(MSG.fix_success(nomor), { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
+                        } catch (e) {
+                            await bot.sendMessage(chatId, MSG.fix_success(nomor), { parse_mode: 'Markdown' });
+                        }
+                    } else {
+                        try {
+                            await bot.editMessageText(MSG.fix_no_reply, { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
+                        } catch (e) {
+                            await bot.sendMessage(chatId, MSG.fix_no_reply, { parse_mode: 'Markdown' });
+                        }
+                    }
+                } else {
+                    await bot.editMessageText(MSG.fix_failed(result.error), { chat_id: chatId, message_id: sentMsg.message_id });
+                }
+                return;
+            }
+
+            else if (state.step === 'ASK_WA_TARGET') {
+                delete userStates[chatId];
+                const cleanedList = text.split('\n').map(n => n.replace(/[^0-9]/g, '')).filter(n => n.length > 5).join('\n');
+                if (!cleanedList) return bot.sendMessage(chatId, "❌ Nomor gak valid semua cuk!");
+
+                const sentMsg = await bot.sendMessage(chatId, MSG.wa_connecting, { parse_mode: 'Markdown' });
+                const hasil = await process_bulk_wa(userId, cleanedList);
+                await bot.editMessageText(hasil || "❌ Error: Hasil kosong.", { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
+                return;
+            }
+
+            else if (state.step === 'ASK_PAIRING_NUMBER') {
+                delete userStates[chatId];
+                const cleanNum = text.replace(/[^0-9]/g, '');
+                const waitMsg = await bot.sendMessage(chatId, "⏳ *Meminta Kode...*", { parse_mode: 'Markdown' });
+                startUserSession(userId, cleanNum, async (response, error) => {
+                    if (response === "CONNECTED") {
+                        try {
+                            await bot.sendMessage(chatId, "✅ *SUKSES TERHUBUNG!*", { parse_mode: 'Markdown' });
+                            await sendMainMenu(chatId, userId);
+                        } catch(e) {}
+                    } else if (response === "REGISTERED") {
+                        bot.editMessageText("⚠️ *Udah Konek Cuk!*", { chat_id: chatId, message_id: waitMsg.message_id, parse_mode: 'Markdown' });
+                    } else if (response) {
+                        bot.editMessageText(MSG.pairing_code(response), { chat_id: chatId, message_id: waitMsg.message_id, parse_mode: 'Markdown' });
+                    } else {
+                        bot.editMessageText(`❌ Gagal: ${error || "Unknown Error"}`, { chat_id: chatId, message_id: waitMsg.message_id });
+                    }
+                });
+                return;
+            }
+        }
+
+        // HANDLER TEXT MENU (BUTTON BAWAH)
+        if (text === '💉 FIX NOMOR') { start_fix(msg); return; }
+        if (text === '🔍 CEK WA') { start_cek_wa(msg); return; }
+        if (text === '🔗 KONEKSI WA') { start_pairing(msg); return; }
+        if (text === '♻️ SETUP EMAIL') { start_setup(msg); return; }
+        if (text === '👤 PROFIL') { show_profile(msg); return; }
+        if (text === '📞 OWNER') { send_vcard(msg); return; }
+
+    } catch (e) { console.log("Msg Error:", e.message); }
+});
+
+// --- COMMAND HANDLERS ---
+bot.onText(/\/start/, (msg) => sendMainMenu(msg.chat.id, String(msg.from.id)));
+bot.onText(/\/pair/, (msg) => start_pairing(msg));
+bot.onText(/\/fix/, (msg) => start_fix(msg));
+bot.onText(/\/cekwa/, (msg) => start_cek_wa(msg));
+bot.onText(/\/owner/, (msg) => send_vcard(msg));
+bot.onText(/\/profile/, (msg) => show_profile(msg));
+bot.onText(/\/myid/, (msg) => bot.sendMessage(msg.chat.id, `ID: \`${msg.from.id}\``, {parse_mode: 'Markdown'}));
+
+// --- OWNER COMMANDS ---
+bot.onText(/\/addprem(.*)/, (msg, match) => {
+    if (String(msg.from.id) !== SAFE_OWNER_ID) return;
+    const args = match[1].trim().split(' ').filter(i => i);
+    if (args.length < 2) return bot.sendMessage(msg.chat.id, MSG.owner_guide_addprem, { parse_mode: 'Markdown' });
+    const targetId = args[0];
+    const days = args[1];
+    const expiry = add_premium(targetId, days);
+    bot.sendMessage(msg.chat.id, MSG.owner_success_prem(targetId, days, expiry), { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/addlimit(.*)/, (msg, match) => {
+    if (String(msg.from.id) !== SAFE_OWNER_ID) return;
+    const args = match[1].trim().split(' ').filter(i => i);
+    if (args.length < 2) return bot.sendMessage(msg.chat.id, MSG.owner_guide_addlimit, { parse_mode: 'Markdown' });
+    const targetId = args[0];
+    const amount = parseInt(args[1]);
+    const db = load_db();
+    if (db[targetId]) {
+        const oldLimit = db[targetId].limit || 0;
+        db[targetId].limit = oldLimit + amount;
+        save_db(db);
+        bot.sendMessage(msg.chat.id, MSG.owner_success_limit(targetId, amount, db[targetId].limit), { parse_mode: 'Markdown' });
+    } else { bot.sendMessage(msg.chat.id, MSG.owner_user_not_found); }
+});
+
+bot.onText(/\/unprem(.*)/, (msg, match) => {
+    if (String(msg.from.id) !== SAFE_OWNER_ID) return;
+    const args = match[1].trim().split(' ').filter(i => i);
+    if (args.length < 1) return bot.sendMessage(msg.chat.id, MSG.owner_guide_unprem, { parse_mode: 'Markdown' });
+    const targetId = args[0];
+    const db = load_db();
+    if (db[targetId]) {
+        db[targetId].role = 'free';
+        db[targetId].limit = 0; 
+        db[targetId].expired = null;
+        save_db(db);
+        bot.sendMessage(msg.chat.id, MSG.owner_success_unprem(targetId), { parse_mode: 'Markdown' });
+    } else { bot.sendMessage(msg.chat.id, MSG.owner_user_not_found); }
+});
+
+
+// --- CALLBACK QUERY (HANDLER) ---
+bot.on('callback_query', async (query) => {
+    const msg = query.message;
+    const chatId = msg.chat.id;
+    const userId = String(query.from.id);
+    const data = query.data;
+
+    bot.answerCallbackQuery(query.id).catch(()=>{});
+
+    if (data === 'menu_fix') start_fix(msg);
+    else if (data === 'menu_cek_wa') start_cek_wa(msg);
+    else if (data === 'menu_pairing') start_pairing(msg);
+    else if (data === 'menu_setup') start_setup(msg);
+    else if (data === 'menu_profile') show_profile(msg);
+    else if (data === 'menu_owner') send_vcard(msg);
+    else if (data === 'menu_owner_panel') {
+        if (userId !== SAFE_OWNER_ID) return bot.sendMessage(chatId, "❌ Lu bukan owner cuk!");
+        const helpText = "👑 *OWNER PANEL*\n\n➕ `/addprem ID HARI`\n➕ `/addlimit ID JUMLAH`\n❌ `/unprem ID`\n🆔 `/myid`";
+        bot.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
+    }
+    
+    // --- HANDLER TIKTOK (BUFFER MODE) ---
+    else if (data === 'tt_vid') {
+        const state = userStates[chatId];
+        if (state && state.video_url) {
+            bot.sendMessage(chatId, "🚀 *Lagi nyedot video TikTok...*", { parse_mode: 'Markdown' });
+            try {
+                const res = await axios.get(state.video_url, { 
+                    responseType: 'arraybuffer', 
+                    timeout: 60000, 
+                    headers: { 
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Referer': 'https://www.tikwm.com/'
+                    } 
+                });
+                await bot.sendVideo(chatId, res.data, { caption: "🎥 Video TikTok Berhasil!" }, { filename: 'tt.mp4', contentType: 'video/mp4' });
+            } catch (e) { bot.sendMessage(chatId, `⚠️ Gagal Upload. Link:\n${state.video_url}`); }
+        }
+    }
+    else if (data === 'tt_aud') {
+        const state = userStates[chatId];
+        if (state && state.music_url) {
+            bot.sendMessage(chatId, "🚀 *Lagi download audio TikTok...*", { parse_mode: 'Markdown' });
+            try {
+                const res = await axios.get(state.music_url, { responseType: 'arraybuffer' });
+                await bot.sendAudio(chatId, res.data, { caption: "🎵 Audio TikTok" }, { filename: 'tt.mp3', contentType: 'audio/mpeg' });
+            } catch (e) { bot.sendMessage(chatId, `⚠️ Gagal Audio. Link:\n${state.music_url}`); }
+        }
+    }
+});
+
+// --- HELPER MENU ---
+const sendMainMenu = async (chatId, userId, extraText = "") => {
+    const isOwner = String(userId) === SAFE_OWNER_ID;
+    
+    const db = load_db();
+    let data = db[userId];
+    
+    if (data && data.role === 'premium' && data.expired) {
+        const today = new Date().toISOString().split('T')[0]; 
+        if (today > data.expired) {
+            data.role = 'free';
+            data.limit = 3;
+            data.expired = null;
+            save_db(db);
+            extraText += "\n⚠️ *Masa Premium habis!* Limit direset ke 3.";
+        }
+    }
+
+    let roleDisp = "❌ BELUM TERDAFTAR";
+    let limitDisp = "0";
+    let expiryDisp = "";
+    let waStatus = checkSessionStatus(userId);
+    const isWAConnected = waStatus.includes("Aktif");
+
+    if (isOwner) { roleDisp = "👑 OWNER"; limitDisp = "UNLIMITED"; }
+    else if (data && data.role === 'premium') { roleDisp = "🌟 PREMIUM"; limitDisp = "UNLIMITED"; expiryDisp = data.expired || "Lifetime"; }
+    else if (data) { roleDisp = "👤 FREE"; limitDisp = `${data.limit}x`; }
+
+    const textBase = MSG.menu_text ? MSG.menu_text(userId, roleDisp, limitDisp, expiryDisp, waStatus) : "Menu Error";
+    const textFull = extraText ? `${extraText}\n${textBase}` : textBase;
+
+    const inlineKeyboard = [];
+    const userReady = (data && data.email) || isOwner;
+
+    if (userReady) {
+        inlineKeyboard.push([{ text: "💉 FIX NOMOR (STEALTH)", callback_data: 'menu_fix' }]);
+        inlineKeyboard.push([{ text: "🔍 CEK WA (BIO/REG)", callback_data: 'menu_cek_wa' }]);
+        inlineKeyboard.push([{ text: "👤 PROFIL", callback_data: 'menu_profile' }]);
+        inlineKeyboard.push([{ text: "♻️ Setup Ulang", callback_data: 'menu_setup' }]);
+    } else {
+        inlineKeyboard.push([{ text: "🔐 SETUP AKUN (WAJIB)", callback_data: 'menu_setup' }]);
+    }
+    
+    if ((isOwner || (data && data.role === 'premium')) && !isWAConnected) {
+        inlineKeyboard.push([{ text: "🔗 KONEKSI WA (PAIRING)", callback_data: 'menu_pairing' }]);
+    }
+    
+    if (isOwner) {
+        inlineKeyboard.push([{ text: "👑 OWNER PANEL", callback_data: 'menu_owner_panel' }]);
+    } else {
+        inlineKeyboard.push([{ text: "📞 CONTACT OWNER", callback_data: 'menu_owner' }]);
+    }
+
+    const replyKeyboard = {
+        keyboard: [["💉 FIX NOMOR", "🔍 CEK WA"], ["👤 PROFIL", "♻️ SETUP EMAIL"], ["📞 OWNER"]],
+        resize_keyboard: true
+    };
+    if ((isOwner || (data && data.role === 'premium')) && !isWAConnected) {
+        replyKeyboard.keyboard.push(["🔗 KONEKSI WA"]);
+    }
+
+    await bot.sendMessage(chatId, textFull, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: inlineKeyboard } });
+    await bot.sendMessage(chatId, MSG.menu_keyboard_text, { parse_mode: 'Markdown', reply_markup: replyKeyboard });
+};
+
+// --- START FUNCTIONS ---
+const start_cek_wa = (msg) => {
+    const chatId = msg.chat.id;
+    const userId = String(msg.from.id);
+    if (!checkSessionStatus(userId).includes("Aktif")) return bot.sendMessage(chatId, "❌ *Koneksi WA dulu cuk!*");
+    userStates[chatId] = { step: 'ASK_WA_TARGET' };
+    bot.sendMessage(chatId, MSG.cek_wa_intro, { parse_mode: 'Markdown' });
+};
+
+const start_pairing = (msg) => {
+    const chatId = msg.chat.id;
+    userStates[chatId] = { step: 'ASK_PAIRING_NUMBER' };
+    bot.sendMessage(chatId, MSG.pairing_intro, { parse_mode: 'Markdown' });
+};
+
+const start_fix = (msg) => {
+    const chatId = msg.chat.id;
+    const data = get_user_data(String(msg.from.id));
+    if (!data || !data.email) return bot.sendMessage(msg.chat.id, MSG.no_setup);
+    userStates[chatId] = { step: 'ASK_FIX_NUMBER' };
+    bot.sendMessage(msg.chat.id, MSG.fix_intro, { parse_mode: 'Markdown' });
+};
+
+const start_setup = (msg) => {
+    const chatId = msg.chat.id;
+    userStates[chatId] = { step: 'ASK_EMAIL', data: {} };
+    bot.sendMessage(chatId, MSG.setup_intro, { parse_mode: 'Markdown' });
+};
+const show_profile = (msg) => sendMainMenu(msg.chat.id, String(msg.from.id));
+const send_vcard = (msg) => bot.sendContact(msg.chat.id, OWNER_NOMOR_HP, OWNER_NAMA);
+
+console.log("🤖 BOT STARTED...");

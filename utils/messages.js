@@ -1,0 +1,73 @@
+// utils/messages.js
+const { BOT_NAME, OWNER_NAMA } = require('../config');
+
+const messages = {
+    // --- MENU UTAMA ---
+    menu_text: (userId, role, limit, expired, waStatus) => {
+        const statusWA = waStatus || "Mati 🔴";
+        const expText = (role && role.includes('PREMIUM')) ? `\n⏳ Expired: ${expired}` : '';
+        
+        return `
+🔥 *${BOT_NAME}* 🔥
+
+👤 *Info User:*
+├ ID: \`${userId}\`
+├ Status: ${role}
+├ WA Conn: ${statusWA}
+└ Limit: ${limit}${expText}
+
+👑 *Owner:* ${OWNER_NAMA}`;
+    },
+
+    menu_keyboard_text: "⌨️ _Menu Cepat Aktif_",
+
+    // --- SETUP ---
+    setup_intro: "💾 *SETUP DATABASE*\n\n1️⃣ Kirim **Email Gmail** lu:",
+    setup_pass: "2️⃣ Kirim **App Password** (16 digit):",
+    setup_name: "3️⃣ Kirim **Nama Lu** (Buat template surat):",
+    setup_done: "✅ *DATA TERSIMPAN!*",
+
+    // --- FIX NOMOR ---
+    fix_intro: "📱 *MODE FIX MERAH (STEALTH)*\nKirim nomor target 62",
+    email_sending: "⏳ *Mengirim Email Laporan...*",
+    email_sent: "✅ *Email Terkirim!*\n\n⏳ _Menunggu balasan (Max 2 Menit)..._",
+    
+    // Hasil Fix
+    fix_success: (nomor) => `✅ *SUKSES FIX MERAH!*\n\n📱 Target: ${nomor}\n📩 *Status:* WhatsApp Membalas!`,
+    fix_no_reply: "⚠️ *SUKSES MENGIRIM*\n\nTapi belum ada balasan masuk dalam 2 menit.",
+    fix_failed: (err) => `❌ *GAGAL KIRIM!*\nError: ${err}`,
+
+    // --- CEK WA ---
+    cek_wa_intro: "🔍 *CEK WA MASSAL (VIP)*\n\nKirim nomor-nomor yang mau dicek.\nPisah pake Enter.\n\nContoh:\n62812345\n62899999",
+    wa_connecting: "⏳ *Sedang Mengecek Nomor (Real-Time)...*",
+
+    // --- PAIRING ---
+    pairing_intro: "🔗 *KONEKSI Cek Bio (PAIRING)*\n\nKirim Nomor WhatsApp kamu (termasuk Kode Negara).\n\nContoh:\n🇮🇩 Indo: 62812xxx\n🇺🇸 US: 1212xxx\n\n_Pastikan nomor benar, kode akan muncul di sini._",
+    pairing_code: (code) => `🔥 *KODE PAIRING LU:*\n\n\`${code}\`\n\n_Masukin kode ini di WhatsApp -> Perangkat Tertaut._`,
+    pairing_registered: "⚠️ *Sesi WhatsApp lu udah aktif cuk!* Langsung pake aja menu Cek WA.",
+
+    // --- ERROR & WARNINGS ---
+    no_setup: "❌ Setup email dulu bloon!",
+    limit_reached: "⛔ *LIMIT HABIS!* Upgrade Premium sana.",
+    owner_setup_alert: "👑 *Owner Mode:* Setup email dulu bos biar bisa ngirim!",
+    
+    insults: [
+        "😂 *MIMPI DEK!* Fitur ini khusus Sultan (Premium/Owner).",
+        "Minimal modal dikit lah, masa gratisan mulu? 🤪",
+        "❌ *Akses Ditolak!* Lu cuma user Free, sadar diri."
+    ],
+    premium_expired: "⚠️ *Masa Premium Lu Habis!* Balik jadi user Free ya.",
+
+    // --- [BARU] FITUR OWNER ---
+    owner_guide_addprem: "❌ *ID nya mana om? Format salah!*\n\nCara: `/addprem ID HARI`\nContoh: `/addprem 12345 30`",
+    owner_guide_addlimit: "❌ *ID nya mana om? Format salah!*\n\nCara: `/addlimit ID JUMLAH`\nContoh: `/addlimit 12345 10`",
+    owner_guide_unprem: "❌ *ID nya mana om? Format salah!*\n\nCara: `/unprem ID`",
+    
+    owner_success_prem: (id, days, exp) => `✅ User \`${id}\` jadi *PREMIUM* selama ${days} hari.\n📅 Expired: ${exp}`,
+    owner_success_limit: (id, add, total) => `✅ Limit user \`${id}\` ditambah ${add}.\nSekarang: ${total}`,
+    owner_success_unprem: (id) => `✅ User \`${id}\` dicabut premiumnya (Jadi Free).`,
+    
+    owner_user_not_found: "❌ User ID tersebut belum terdaftar di database (Belum pernah /start)."
+};
+
+module.exports = messages;

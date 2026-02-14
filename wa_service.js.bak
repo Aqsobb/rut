@@ -1,0 +1,139 @@
+// wa_service.js
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    DisconnectReason, 
+    fetchLatestBaileysVersion, 
+    makeCacheableSignalKeyStore, 
+    jidDecode 
+} = require("@whiskeysockets/baileys");
+const pino = require('pino');
+const fs = require('fs');
+const { load_db, save_db } = require('./database');
+
+let sessions = {};
+
+// Fungsi cek status buat ditampilin di menu Telegram
+const checkSessionStatus = (userId) => {
+    if (sessions[userId] && sessions[userId].user) return "✅ Aktif";
+    return "❌ Tidak Aktif";
+};
+
+// Fungsi utama koneksi WA
+const startUserSession = async (userId, nomor, callback) => {
+    const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${userId}`);
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+
+    const sock = makeWASocket({
+        version,
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: false, // Kita pake Pairing Code
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+        },
+        browser: ["Stealth Bot", "Chrome", "1.0.0"],
+        markOnlineOnConnect: true,
+    });
+
+    sessions[userId] = sock;
+
+    // Logika Pairing Code
+    if (!sock.authState.creds.registered) {
+        if (!nomor) return;
+        setTimeout(async () => {
+            try {
+                let code = await sock.requestPairingCode(nomor.replace(/[^0-9]/g, ''));
+                code = code?.match(/.{1,4}/g)?.join("-") || code;
+                callback(code);
+            } catch (e) {
+                callback(null, e.message);
+            }
+        }, 3000);
+    }
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log(`📡 Koneksi Terputus: ${lastDisconnect.error?.message}. Reconnecting: ${shouldReconnect}`);
+            if (shouldReconnect) startUserSession(userId, nomor, callback);
+        } else if (connection === 'open') {
+            console.log(`✅ WA Connected: ${userId}`);
+            callback("CONNECTED");
+        }
+    });
+
+    // Event Messages (Biar bot lu bisa denger chat WA kalau nanti lu mau tambahin fitur bridge)
+    sock.ev.on('messages.upsert', async (chatUpdate) => {
+        // Lu bisa taruh logika auto-reply WA di sini nanti
+    });
+
+    return sock;
+};
+
+// --- FITUR UTAMA: CEK BIO MASSAL (FIX PRIVASI) ---
+const process_bulk_wa = async (userId, listNomor) => {
+    const sock = sessions[userId];
+    if (!sock) return "❌ Sesi WA belum aktif cuk! Pairing dulu di menu.";
+
+    let hasil = "🔍 *HASIL CEK BIO MASSAL*\n\n";
+    const nomorArray = listNomor.split('\n').filter(n => n.trim() !== "");
+
+    for (let nomor of nomorArray) {
+        let cleanNomor = nomor.replace(/[^0-9]/g, '');
+        if (!cleanNomor.startsWith('62') && !cleanNomor.startsWith('0')) cleanNomor = '62' + cleanNomor;
+        if (cleanNomor.startsWith('0')) cleanNomor = '62' + cleanNomor.slice(1);
+        
+        const jid = `${cleanNomor}@s.whatsapp.net`;
+        
+        try {
+            // 1. Cek apakah nomor terdaftar
+            const [result] = await sock.onWhatsApp(jid);
+            
+            if (result && result.exists) {
+                // 🔥 KUNCI FIX BIO PRIVASI: 
+                // Kita kasih jeda 2.5 detik biar server WA gak curiga bot/spam
+                await new Promise(resolve => setTimeout(resolve, 2500));
+                
+                let bio = "Privasi / Hidden";
+                try {
+                    const status = await sock.fetchStatus(jid);
+                    // Jika bionya ada, ambil. Jika null/undefined, berarti emang privasi/kosong.
+                    if (status && status.status !== undefined) {
+                        bio = status.status;
+                    }
+                } catch (e) {
+                    bio = "Privasi (Setting WA)";
+                }
+                
+                hasil += `✅ *${cleanNomor}*\n└ Bio: _${bio}_\n\n`;
+            } else {
+                hasil += `❌ *${cleanNomor}*\n└ Status: Gak Terdaftar\n\n`;
+            }
+        } catch (e) {
+            hasil += `⚠️ *${cleanNomor}*\n└ Status: Error Check\n\n`;
+        }
+        
+        // Jeda antar nomor biar gak gampang ke-ban
+        await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+    
+    return hasil;
+};
+
+// Auto resume semua sesi yang ada di folder sessions
+const initAutoResume = async () => {
+    if (!fs.existsSync('./sessions')) return;
+    const folders = fs.readdirSync('./sessions');
+    for (const userId of folders) {
+        if (fs.lstatSync(`./sessions/${userId}`).isDirectory()) {
+            console.log(`♻️ Resuming session: ${userId}`);
+            startUserSession(userId, "", () => {});
+        }
+    }
+};
+
+module.exports = { startUserSession, process_bulk_wa, initAutoResume, checkSessionStatus };

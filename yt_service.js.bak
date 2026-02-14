@@ -1,0 +1,45 @@
+// yt_service.js
+const yts = require('yt-search');
+const { youtube } = require('@vreden/youtube_scraper'); // Pake yang ada di package.json lu
+
+const searchYT = async (query) => {
+    try {
+        const r = await yts(query);
+        const video = r.videos[0];
+        if (!video) return { status: false };
+        return {
+            status: true,
+            title: video.title,
+            url: video.url,
+            duration: video.timestamp,
+            views: video.views,
+            author: video.author.name,
+            thumbnail: video.thumbnail
+        };
+    } catch (e) { return { status: false }; }
+};
+
+// LOGIKA YTDL YANG SAMA PERSIS DENGAN POLA WA LU
+const ytdl = {
+    ytmp3: async (url) => {
+        try {
+            // Menggunakan library @vreden/youtube_scraper yang ada di package.json lu
+            const data = await youtube(url);
+            return {
+                status: true,
+                download: { url: data.mp3 } // Output: anu.download.url
+            };
+        } catch (e) { return { status: false }; }
+    },
+    ytmp4: async (url) => {
+        try {
+            const data = await youtube(url);
+            return {
+                status: true,
+                download: { url: data.mp4 } // Output: anu.download.url
+            };
+        } catch (e) { return { status: false }; }
+    }
+};
+
+module.exports = { searchYT, ytdl };
