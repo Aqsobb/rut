@@ -1,15 +1,16 @@
 {
   "name": "telebot",
   "version": "1.0.0",
-  "description": "",
+  "description": "Linguistic Research Automation Tool",
   "main": "index.js",
+  "type": "module",
   "scripts": {
+    "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "",
+  "author": "Gusionly",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "axios": "^1.13.2",
